@@ -3,3 +3,15 @@
 
 # Ada Library Information
 *.ali
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Логи й тимчасові файли
+*.log
+server.log
+.DS_Store
