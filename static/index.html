@@ -1,0 +1,208 @@
+<!DOCTYPE html>
+<html lang="uk">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Нестабільний сервер · монітор пінгу</title>
+<style>
+  :root {
+    --bg: #0b0f17; --panel: #121926; --line: #1f2a3d;
+    --text: #e6edf7; --muted: #8b9bb4;
+    --ok: #34d399; --bad: #f87171; --warn: #fbbf24; --accent: #60a5fa;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font: 15px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+  header {
+    padding: 22px 24px; border-bottom: 1px solid var(--line);
+    display: flex; align-items: center; gap: 14px; flex-wrap: wrap;
+  }
+  header h1 { font-size: 18px; margin: 0; letter-spacing: .5px; }
+  .dot { width: 11px; height: 11px; border-radius: 50%; background: var(--muted); box-shadow: 0 0 12px currentColor; }
+  .dot.up { background: var(--ok); color: var(--ok); }
+  .dot.down { background: var(--bad); color: var(--bad); animation: blink .6s infinite alternate; }
+  @keyframes blink { to { opacity: .25; } }
+  main { padding: 22px 24px; display: grid; gap: 18px; max-width: 1080px; margin: 0 auto; }
+  .grid { display: grid; gap: 14px; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); }
+  .card { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 14px 16px; }
+  .card .label { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: 1px; }
+  .card .value { font-size: 26px; margin-top: 4px; }
+  .value.ok { color: var(--ok); } .value.bad { color: var(--bad); } .value.warn { color: var(--warn); }
+  canvas { width: 100%; height: 130px; display: block; }
+  .row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+  button, select {
+    background: #182133; color: var(--text); border: 1px solid var(--line);
+    border-radius: 8px; padding: 8px 12px; font: inherit; cursor: pointer;
+  }
+  button:hover { border-color: var(--accent); }
+  #log { max-height: 260px; overflow: auto; font-size: 13px; }
+  #log div { padding: 2px 0; border-bottom: 1px dashed #16202f; white-space: nowrap; }
+  #log .ok { color: var(--ok); } #log .bad { color: var(--bad); }
+  small { color: var(--muted); }
+</style>
+</head>
+<body>
+<header>
+  <span id="stateDot" class="dot"></span>
+  <h1>нестабільний сервер · live монітор</h1>
+  <small id="stateText">очікування…</small>
+</header>
+
+<main>
+  <div class="grid">
+    <div class="card"><div class="label">останній пінг</div><div class="value" id="lastMs">—</div></div>
+    <div class="card"><div class="label">success rate</div><div class="value" id="rate">—</div></div>
+    <div class="card"><div class="label">запитів</div><div class="value" id="total">0</div></div>
+    <div class="card"><div class="label">помилок</div><div class="value" id="fails">0</div></div>
+    <div class="card"><div class="label">p95 (сервер)</div><div class="value" id="p95">—</div></div>
+    <div class="card"><div class="label">uptime</div><div class="value" id="uptime">—</div></div>
+  </div>
+
+  <div class="card">
+    <div class="label">затримка, мс (останні 120 пінгів)</div>
+    <canvas id="chart" width="1040" height="130"></canvas>
+  </div>
+
+  <div class="card">
+    <div class="label">керування хаосом</div>
+    <div class="row" style="margin-top:10px">
+      <label>рівень
+        <select id="level">
+          <option value="off">off</option>
+          <option value="light">light</option>
+          <option value="medium" selected>medium</option>
+          <option value="heavy">heavy</option>
+          <option value="insane">insane</option>
+        </select>
+      </label>
+      <button id="apply">застосувати</button>
+      <button id="outage">аварія на 5 с</button>
+      <button id="reset">скинути метрики</button>
+      <span class="row" style="margin-left:auto">
+        <label><input type="checkbox" id="auto" checked> авто-пінг</label>
+        <button id="once">пінг зараз</button>
+      </span>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="label">журнал</div>
+    <div id="log"></div>
+  </div>
+</main>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const history = [];           // {ms, ok}
+let total = 0, fails = 0, timer = null;
+
+function addLog(text, ok) {
+  const log = $('log');
+  const line = document.createElement('div');
+  line.className = ok ? 'ok' : 'bad';
+  const stamp = new Date().toLocaleTimeString('uk-UA');
+  line.textContent = `[${stamp}] ${text}`;
+  log.prepend(line);
+  while (log.children.length > 200) log.removeChild(log.lastChild);
+}
+
+function draw() {
+  const c = $('chart'), ctx = c.getContext('2d');
+  ctx.clearRect(0, 0, c.width, c.height);
+  if (history.length < 2) return;
+  const max = Math.max(50, ...history.map(h => (h.ok ? h.ms : 0)));
+  ctx.strokeStyle = '#1f2a3d'; ctx.lineWidth = 1;
+  for (let i = 1; i < 4; i++) {
+    const y = c.height / 4 * i;
+    ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(c.width, y); ctx.stroke();
+  }
+  const step = c.width / (history.length - 1);
+  ctx.beginPath();
+  history.forEach((h, i) => {
+    const x = i * step;
+    const y = h.ok ? c.height - (h.ms / max) * (c.height - 10) - 5 : c.height;
+    i ? ctx.lineTo(x, y) : ctx.moveTo(x, y);
+  });
+  ctx.strokeStyle = '#60a5fa'; ctx.lineWidth = 2; ctx.stroke();
+  history.forEach((h, i) => {
+    if (h.ok) return;
+    ctx.fillStyle = '#f87171';
+    ctx.fillRect(i * step - 1, 0, 2, c.height);
+  });
+}
+
+function render(health) {
+  const rate = total ? 100 * (total - fails) / total : 100;
+  $('total').textContent = total;
+  $('fails').textContent = fails;
+  $('fails').className = 'value ' + (fails ? 'bad' : 'ok');
+  $('rate').textContent = rate.toFixed(1) + '%';
+  $('rate').className = 'value ' + (rate >= 99 ? 'ok' : rate >= 60 ? 'warn' : 'bad');
+  if (health) {
+    $('p95').textContent = health.latency_ms.p95 + ' мс';
+    $('uptime').textContent = health.uptime_s + ' с';
+    const dot = $('stateDot'), txt = $('stateText');
+    dot.className = 'dot ' + (health.state === 'up' ? 'up' : 'down');
+    txt.textContent = health.state + (health.outage.active
+      ? ` · аварія ще ${health.outage.seconds_left} с` : '');
+  }
+  draw();
+}
+
+async function ping() {
+  const started = performance.now();
+  try {
+    const r = await fetch('/ping', { cache: 'no-store' });
+    const ms = performance.now() - started;
+    const body = await r.json();          // кине помилку на обірваному тілі
+    total++;
+    if (!r.ok) fails++;
+    history.push({ ms, ok: r.ok });
+    if (history.length > 120) history.shift();
+    $('lastMs').textContent = ms.toFixed(0) + ' мс';
+    $('lastMs').className = 'value ' + (r.ok ? 'ok' : 'bad');
+    addLog(`${r.status} /ping — ${ms.toFixed(0)} мс${r.ok ? '' : ' · ' + (body.error || '')}`, r.ok);
+  } catch (e) {
+    const ms = performance.now() - started;
+    total++; fails++;
+    history.push({ ms, ok: false });
+    if (history.length > 120) history.shift();
+    $('lastMs').textContent = 'ERR';
+    $('lastMs').className = 'value bad';
+    addLog(`збій /ping — ${e.name || 'network error'} (${ms.toFixed(0)} мс)`, false);
+  }
+  try {
+    const h = await fetch('/health', { cache: 'no-store' });
+    render(await h.json());
+  } catch (_) { render(null); }
+}
+
+function loop() { clearInterval(timer); timer = setInterval(ping, 1000); }
+
+$('apply').onclick = async () => {
+  const level = $('level').value;
+  try {
+    const r = await fetch('/admin/chaos', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ level })
+    });
+    const b = await r.json();
+    addLog(`рівень хаосу → ${b.level || '?'} (${r.status})`, r.ok);
+  } catch (e) { addLog('не вдалося змінити рівень: ' + e.name, false); }
+};
+$('outage').onclick = () => fetch('/admin/outage', {
+  method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ seconds: 5 })
+}).then(() => addLog('запущено аварію на 5 с', true)).catch(e => addLog('outage: ' + e.name, false));
+$('reset').onclick = () => fetch('/admin/reset', { method: 'POST' })
+  .then(() => { total = fails = 0; history.length = 0; addLog('метрики скинуто', true); render(null); })
+  .catch(e => addLog('reset: ' + e.name, false));
+$('once').onclick = ping;
+$('auto').onchange = (e) => e.target.checked ? loop() : clearInterval(timer);
+
+fetch('/admin/chaos').then(r => r.json()).then(b => { if (b.level) $('level').value = b.level; });
+ping(); loop();
+</script>
+</body>
+</html>
